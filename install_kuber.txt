@@ -1,0 +1,123 @@
+- sudo swapoff -a
+- sudo sed -i '/ swap / s/^/#/' /etc/fstab
+######
+- vim /etc/hosts
+######
+- cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+- sudo modprobe overlay
+- sudo modprobe br_netfilter
+- cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOF
+- sudo sysctl --system
+######
+- cd /tmp/
+- wget https://github.com/containerd/containerd/releases/download/v1.7.23/containerd-1.7.23-linux-amd64.tar.gz
+- sudo tar Cxzvf /usr/local containerd-1.7.23-linux-amd64.tar.gz
+- sudo wget -O /usr/lib/systemd/system/containerd.service https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+- sudo systemctl daemon-reload
+- sudo systemctl enable --now containerd
+#######
+- wget https://github.com/opencontainers/runc/releases/download/v1.2.0/runc.amd64
+- sudo install -m 755 runc.amd64 /usr/local/sbin/runc
+#######
+- wget https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-amd64-v1.6.0.tgz
+- sudo mkdir -p /opt/cni/bin
+- sudo tar Cxzvf /opt/cni/bin cni-plugins-linux-amd64-v1.6.0.tgz
+#######
+- sudo mkdir /etc/containerd && sudo touch /etc/containerd/config.toml && sudo containerd config default > /etc/containerd/config.toml 
+- sudo vi /etc/containerd/config.toml -----------> set this 'SystemdCgroup = true'
+- sudo systemctl restart containerd
+#######
+- sudo apt update
+- sudo apt install -y apt-transport-https ca-certificates curl gpg
+- sudo mkdir -p -m 755 /etc/apt/keyrings
+- curl -fsSL -x http://127.0.0.1:20171 https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | sudo gpg --dearmor -o /home/mtorabi/kubernetes-apt-keyring.gpg (i use a proxy on my local system to get this key (use v2raya for this))
+- echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] http://192.168.122.1:8586/repository/apt-proxy/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list (about this address 'http://192.168.122.1:8586/repository/apt-proxy/' this is address of my apt-proxy repo in my local nexus)
+- sudo apt update
+- sudo apt install -y kubelet kubeadm kubectl
+- sudo apt-mark hold kubelet kubeadm kubectl
+- sudo systemctl enable --now kubelet
+########
+okay to get images we have to mirror so step by step is below
+- vim /etc/containerd/config.toml -------> add this 
+      [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."*"]
+          endpoint = ["http://192.168.122.1:6001"] (this is address of docker group (in this docker group i have three repo 1-local-repo 2-docker-proxy 3-docker-k8s))
+
+	1-local-repo ---> get image of coredns in local because of address then push it in this repo. set of port 6000 and allow anonymous docker pull.
+		- docker pull 127.0.0.1:6001/coredns/coredns:v1.11.3
+		- docker tag 127.0.0.1:6001/coredns/coredns:v1.11.3 127.0.0.1:6000/coredns:v1.11.3
+		- docker login 127.0.0.1:6000
+		- docker push 127.0.0.1:6000/coredns:v1.11.3
+	2-docker-proxy ---> no port, remote storage set (https://registry.docker.ir), allow anonymous docker pull
+	3-docker-k8s ---> no port, remote storage set (https://registry.k8s.io)
+	notice: in nexus in System/HTTP we set this ---> enabel http proxy, 172.17.0.1:1080 this is address of container v2fly/v2fly-core that use config of v2ray 
+	notice: in nexus in Security/Realms add Docker Bearer Token Realm
+          
+- systemctl restart containerd
+- sudo kubeadm config images list --image-repository=192.168.122.1:6001
+- sudo kubeadm config images pull --image-repository=192.168.122.1:6001 
+- kubeadm init --apiserver-advertise-address=192.168.122.147 --pod-network-cidr=10.96.0.0/16 --service-cidr=10.96.0.0/16 --image-repository=192.168.122.1:6001 --dry-run
+- this is give you command to add other nodes to your cluster
+- # Copy client config
+mkdir -p $HOME/.kube
+sudo cp -f -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+########
+#calico installation
+- kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.30.2/manifests/operator-crds.yaml
+- curl https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/custom-resources.yaml -O
+
+***
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  # Configures Calico networking.
+  registry: 192.168.122.1:6001
+  calicoNetwork:
+    ipPools:
+    - name: default-ipv4-ippool
+      blockSize: 26
+      cidr: 10.96.0.0/16
+      encapsulation: VXLANCrossSubnet
+      natOutgoing: Enabled
+      nodeSelector: all()
+  serviceCIDRs:
+   - 10.98.0.0/16
+
+---
+
+# This section configures the Calico API server.
+# For more information, see: https://docs.tigera.io/calico/latest/reference/installation/api#operator.tigera.io/v1.APIServer
+apiVersion: operator.tigera.io/v1
+kind: APIServer
+metadata:
+  name: default
+spec: {}
+
+---
+
+# Configures the Calico Goldmane flow aggregator.
+apiVersion: operator.tigera.io/v1
+kind: Goldmane
+metadata:
+  name: default
+
+---
+
+# Configures the Calico Whisker observability UI.
+apiVersion: operator.tigera.io/v1
+kind: Whisker
+metadata:
+  name: default
+***
+
+- kubectl create -f custom-resources.yaml
