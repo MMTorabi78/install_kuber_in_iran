@@ -121,3 +121,14 @@ metadata:
 ***
 
 - kubectl create -f custom-resources.yaml
+#####
+#add alis of k in bash
+if [ -f /etc/bash_completion ] && ! shopt -oq posix; then
+    . /etc/bash_completion
+fi
+
+alias k=kubectl
+source <(k completion bash)
+complete -o default -F __start_kubectl k
+
+- source ~/.bashrc
